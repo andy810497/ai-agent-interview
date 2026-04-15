@@ -1,0 +1,10 @@
+# Python 暫存檔
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Mac 系統檔
+.DS_Store
+
+# 環境變數與機密檔案
+.env

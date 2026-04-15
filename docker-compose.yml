@@ -1,0 +1,84 @@
+version: '3.8'
+# ==========================================
+# 1. 設定kafka 還有db能寫出log的大小 避免硬碟爆炸
+# ==========================================
+x-logging-default: &logging-default
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ==========================================
+  # 2. 基礎設施
+  # ==========================================
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    logging: *logging-default
+
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  
+  db:
+    image: postgres:15-alpine
+    container_name: agent_db
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: insurance_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db_init:/docker-entrypoint-initdb.d #自動初始化資料
+    logging: *logging-default
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d insurance_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+ # ==========================================
+  # 3. 應用程式 producer與consumer
+  # ==========================================
+  producer:
+    build: ./producer
+    container_name: agent_producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  consumer:
+    build: ./consumer
+    container_name: agent_consumer
+    environment:
+      - DB_HOST=db
+      - DB_NAME=insurance_db
+      - DB_USER=user
+      - DB_PASS=password
+      - GEMINI_API_KEY=YOUR_GEMINI_API_KEY_HERE
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
