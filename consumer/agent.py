@@ -116,8 +116,8 @@ def main():
     # 2. 初始化 Agent，注入 DB 工具
     agent = InsuranceAgent(api_key=os.getenv("GEMINI_API_KEY"), db_tool=db)
     
-    # 3. 建立 DLQ 專用的 Producer
-    dlq_producer = Producer({'bootstrap.servers': 'kafka:29092'})
+    # 3. 建立 DLQ 與Result紀錄的 Producer
+    kafka_producer = Producer({'bootstrap.servers': 'kafka:29092'})
 
     # 4. 初始化 Kafka Consumer
     consumer = Consumer({
@@ -132,7 +132,7 @@ def main():
         while True:
             msg = consumer.poll(1.0)
             # 讓 DLQ Producer 在背景清理緩衝區，避免emory Leak
-            dlq_producer.poll(0)
+            kafka_producer.poll(0)
             
             if msg is None:
                 continue
@@ -154,13 +154,30 @@ def main():
                 
                 if final_answer:
                     logging.info(f"✅ [Agent 處理完成] 最終回覆:\n{final_answer}\n" + "-"*50)
+
+                    result_payload = {
+                        "task_id": task_id,
+                        "instruction": instruction,
+                        "answer": final_answer,
+                        "status": "SUCCESS",
+                        "processed_at": time.time(),
+                        "model": "gemini-2.5-flash"
+                    }
+
+                    # 發布到下游 Topic
+                    kafka_producer.produce(
+                        topic='processed-events',
+                        value=json.dumps(result_payload, ensure_ascii=False).encode('utf-8'),
+                        key=task_id # 使用 task_id 當 Key，確保同一使用者的訊息在 Kafka 內的分區順序
+                    )
+
                 
                 # 處理完畢後，手動確認 (Commit) 訊息已完成
                 consumer.commit(message=msg)
                 
             except json.JSONDecodeError:
                 logging.error("❌ 收到格式錯誤的訊息，送往 DLQ。")
-                dlq_producer.produce(
+                kafka_producer.produce(
                     topic='incoming-requests.DLQ',
                     value=msg.value(),  # 原始訊息原封不動送過去
                 )
@@ -178,7 +195,7 @@ def main():
         logging.info("🛑 收到停止訊號，準備關閉 Consumer...")
     finally:
         #只有在系統真正要關閉時，才使用 flush 確保所有 DLQ 訊息都送達
-        dlq_producer.flush()
+        kafka_producer.flush()
         consumer.close()
         logging.info("👋 Consumer 安全關閉。")
 

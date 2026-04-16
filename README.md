@@ -1,90 +1,133 @@
 # AI Agentic System: Insurance Claim & Support Worker
 
-## Objective
-A containerized, asynchronous AI agentic system built with Python, Kafka, PostgreSQL, and the GCP Gemini API. This system simulates a background worker that processes insurance inquiries and claims, demonstrating autonomous tool-use (Function Calling), cost awareness, and production-grade resilience.
+A containerized, event-driven AI agentic system built with Python, Kafka, PostgreSQL, and the GCP Gemini API. The system simulates a production-grade background worker that autonomously processes insurance inquiries and claims using LLM function calling, with built-in resilience and cost control.
+
+---
 
 ## System Architecture
 
-The system follows a decoupled, event-driven architecture to ensure stability under fluctuating LLM API latency.
+```
+[Producer] ──► [Kafka: incoming-requests] ──► [Agent / Consumer]
+                                                      │
+                                              [Tool: PolicyDatabase]
+                                                      │
+                                                [PostgreSQL]
+                                                      │
+                                         [Kafka: processed-events]
+```
 
-* **Producer:** Simulates incoming customer requests (both standard inquiries and edge cases like missing info) and publishes them to Kafka. Includes application-level retry logic to handle the gap between Docker healthcheck passing and Kafka being fully ready.
-* **Kafka (KRaft mode):** Acts as the asynchronous message broker, buffering requests so the upstream isn't blocked by LLM processing times. Runs without Zookeeper using the modern KRaft consensus protocol.
-* **Agent (Consumer):** The core AI worker. It consumes messages, reasons using `gemini-2.5-flash`, and autonomously decides when to query the database.
-* **PostgreSQL:** Serves as the source of truth for policy data.
+The architecture is deliberately decoupled so that each component has a single responsibility and can be scaled or replaced independently.
+
+- **Producer** — Simulates incoming customer requests (standard inquiries and edge cases) and publishes them to Kafka. Includes application-level retry logic to bridge the gap between Docker healthcheck passing and Kafka being truly ready.
+- **Kafka (KRaft mode)** — Acts as the asynchronous message broker. Buffers requests so the upstream system is never blocked by LLM processing latency. Runs without Zookeeper using the modern KRaft consensus protocol.
+- **Agent (Consumer)** — The core AI worker. Consumes messages from Kafka, reasons using `gemini-2.5-flash`, and autonomously decides when to invoke database tools. Publishes structured results to `processed-events` for downstream consumption.
+- **PostgreSQL** — The source of truth for policy data. Accessed exclusively through the `PolicyDatabase` tool, which is injected into the Agent.
+
+---
 
 ## Quick Start
 
 ### Prerequisites
-* Docker and Docker Compose (v2) installed.
-* A valid GCP Gemini API Key.
+
+- Docker and Docker Compose (v2) installed
+- A valid GCP Gemini API Key
 
 ### Setup
 
 1. Create a `.env` file in the project root:
+
    ```bash
    GEMINI_API_KEY=your_actual_api_key_here
+   DB_USER=user
+   DB_PASSWORD=password
+   DB_NAME=insurance_db
    ```
-   > `.env` is already in `.gitignore` and will never be committed to version control.
+
+   > `.env` is already listed in `.gitignore` and will never be committed to version control.
 
 2. Build and start all services:
+
    ```bash
    docker compose up --build -d
    ```
 
-3. Watch the agent in action:
+3. Watch the agent process tasks in real time:
+
    ```bash
    docker logs -f agent_consumer
    ```
 
 4. Gracefully shut down and clean up:
+
    ```bash
    docker compose down
    ```
 
 ---
 
-## Design Reasoning & Evaluation Criteria
+## Design Reasoning
 
-### 1. Code Quality & Isolatable Dependencies (Clean Architecture)
+### 1. Clean Architecture & Isolatable Dependencies
 
-`agent.py` is structured using OOP and Dependency Injection (DI) to ensure high maintainability and testability.
+`agent.py` is structured around OOP and Dependency Injection (DI) to maximise maintainability and testability.
 
-* **Separation of Concerns:** `PolicyDatabase` handles all PostgreSQL interactions; `InsuranceAgent` handles LLM reasoning. Neither knows about Kafka.
+**Separation of Concerns** — `PolicyDatabase` owns all PostgreSQL interactions; `InsuranceAgent` owns LLM reasoning. Neither class knows about Kafka. The Kafka integration lives exclusively in `main()`, which wires the components together.
 
-* **Verifiability:** The agent's core logic is completely decoupled from Kafka and the actual database. In a testing environment, the database dependency can be replaced with a `MockDB` without altering any agent logic.
+**Verifiability** — Because the Agent receives its database tool via constructor injection, swapping the real `PolicyDatabase` for a `MockDB` in tests requires zero changes to agent logic. The core reasoning loop is testable in complete isolation.
 
-* **Connection Pooling:** `PolicyDatabase` uses `psycopg2.SimpleConnectionPool` instead of opening and closing a new connection on every query. This avoids connection overhead at scale and bounds the maximum number of concurrent DB connections.
+**Connection Pooling** — `PolicyDatabase` uses `psycopg2.SimpleConnectionPool` rather than opening a new connection per query. This eliminates per-query connection overhead and caps the maximum number of concurrent database connections to 5, making resource consumption predictable.
 
 ### 2. Stability & Graceful Degradation
 
-The system is designed to remain stable under common failure and edge cases.
+**Two-Layer Readiness Check** — Docker Compose `service_healthy` conditions enforce startup order at the orchestration level. The Producer additionally performs an application-level check using `list_topics()` with retry logic, because *infrastructure healthy ≠ application ready* in distributed systems. This two-layer approach catches the gap between a container passing its healthcheck and the application inside being fully operational.
 
-* **Two-Layer Readiness Check:** Docker Compose `service_healthy` conditions ensure infrastructure is up before containers start. The Producer additionally performs an application-level Kafka connectivity check (`list_topics`) with retry logic on startup — because *infrastructure ready ≠ application ready* in distributed systems.
+**No Data Loss (Manual Commit)** — `enable.auto.commit` is set to `False`. A Kafka offset is committed only after the Agent has successfully processed and published the result. If processing fails for any reason, the message remains in Kafka and will be redelivered on the next consumer run.
 
-* **No Data Loss (Manual Commit):** `enable.auto.commit` is set to `False`. Messages are only committed after the agent successfully processes them. If processing fails, the message remains in Kafka and will be reprocessed.
+**429 Rate Limit Handling** — On receiving a 429 response, the Agent retries up to 3 times with linear backoff (60s → 120s → 180s). Only on confirmed success is the offset committed. If all retries are exhausted, the message is intentionally left uncommitted so it is preserved for the next run without manual intervention.
 
-* **429 Rate Limit Handling with Retry:** Instead of sleeping once and discarding the message, the agent retries up to 3 times with exponential backoff (60s → 120s → 180s). Only on confirmed success is the Kafka offset committed. If all retries are exhausted, the message is intentionally not committed, preserving it for the next consumer run.
+**Dead Letter Queue (DLQ)** — Malformed messages (e.g., invalid JSON) that cannot be parsed are forwarded to `incoming-requests.DLQ` before the offset is committed. This ensures unparseable messages never block the main queue, while remaining available for manual inspection and replay once the root cause is resolved.
 
-* **Dead Letter Queue (DLQ):** Malformed messages (e.g., invalid JSON) that cannot be processed are forwarded to a `incoming-requests.DLQ` Kafka topic before being committed. This ensures bad messages don't block the main queue, while still being available for manual inspection and replay after the root cause is fixed.
-
-* **Edge Case Resiliency:** The producer injects "poison pills" (missing policy numbers, fake IDs). The agent uses LLM reasoning to gracefully handle these instead of crashing.
+**Edge Case Resiliency** — The Producer injects "poison pill" messages: requests with missing policy numbers and requests referencing non-existent policy IDs. The Agent handles these gracefully via LLM reasoning rather than crashing.
 
 ### 3. Code Ownership & Cost Awareness
 
-Controlling LLM token consumption is a primary design consideration for this pipeline.
+**Model Selection** — `gemini-2.5-flash` was chosen over the Pro variant. For structured classification and database tool-use, Flash provides the right balance of low latency and cost-effectiveness. The model can be swapped in a single line if requirements change.
 
-* **Model Selection:** `gemini-2.5-flash` was chosen over the Pro version. For procedural classification and database tool-use, Flash provides the right balance of low latency and cost-effectiveness.
+**Token Tracking** — Every API call captures `usage_metadata` and logs Prompt Tokens, Candidate Tokens, and a running cumulative total as separate values. Input and output tokens carry different unit costs on Gemini's pricing model, so separating them makes it possible to diagnose whether cost growth is driven by prompt design (input) or response verbosity (output).
 
-* **Token Tracking Ledger:** Every API call intercepts `usage_metadata` and logs Prompt Tokens, Candidate Tokens, and a running cumulative total separately — because input and output tokens have different unit costs on Gemini's pricing model, making it possible to diagnose whether cost is driven by prompt design or response verbosity.
+**Controlled Throughput** — The Producer randomises its send interval between 10 and 20 seconds, simulating realistic traffic patterns and preventing runaway token consumption during development.
 
 ### 4. Secret Management
 
-API keys are loaded from a `.env` file via Docker Compose environment variable substitution (`${GEMINI_API_KEY}`). The `.env` file is excluded from version control via `.gitignore`. In a production environment, this would be replaced with a dedicated secret manager (e.g., GCP Secret Manager or AWS Secrets Manager).
+Secrets are loaded from a `.env` file via Docker Compose environment variable substitution. The `.env` file is excluded from version control via `.gitignore`. In a production environment, this would be replaced with a dedicated secret manager such as GCP Secret Manager or AWS Secrets Manager.
+
+---
+
+## Project Structure
+
+```
+.
+├── docker-compose.yml
+├── .env                    # Not committed — see Setup
+├── .gitignore
+├── db_init/
+│   └── init.sql            # Schema and seed data for PostgreSQL
+├── producer/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── main.py             # Kafka Producer with retry logic
+└── consumer/
+    ├── Dockerfile
+    ├── requirements.txt
+    └── agent.py            # PolicyDatabase + InsuranceAgent + Kafka Consumer
+```
 
 ---
 
 ## Future Enhancements
 
-* **Downstream Integration:** Instead of only logging the final answer, publish the agent's structured output to a `processed-events` Kafka topic for downstream microservices to consume.
+**Partition Scaling** — The current setup uses a single Kafka partition. To horizontally scale consumers, the topic partition count would need to be increased, allowing multiple consumer instances within the same `group.id` to process messages in parallel without duplication.
 
-* **Partition Scaling:** The current setup uses a single Kafka partition. To horizontally scale consumers, the topic partition count would need to be increased, allowing multiple consumer instances within the same `group.id` to process messages in parallel.
+**Thread-Safe Token Accounting** — The current token counter is a class-level variable suitable for single-threaded operation. In a multi-threaded consumer, this would be replaced with an atomic counter or a `threading.Lock`-protected update to eliminate race conditions.
+
+**Persistent Result Storage** — Agent responses are currently published to `processed-events` and logged. A natural next step is writing structured results to a `results` table in PostgreSQL to support audit trails, analytics, and replay.

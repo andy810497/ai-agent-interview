@@ -4,6 +4,10 @@ FROM python:3.11-slim
 # 設定工作目錄
 WORKDIR /app
 
+# 讓docker logs看的到producer的訊息
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
 # 先複製 requirements.txt 並安裝套件
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

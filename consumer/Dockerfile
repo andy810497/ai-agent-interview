@@ -1,5 +1,5 @@
-# 1. 使用官方的 slim (瘦身) 版本作為基底，體積小且穩定
-FROM python:3.10-slim
+# 使用輕量級的 Python 3.11 映像檔
+FROM python:3.11-slim
 
 # 2. 設定環境變數
 # 不寫入 .pyc 暫存檔，節省空間
