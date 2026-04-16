@@ -39,6 +39,19 @@ def generate_mock_task():
     task["timestamp"] = time.time()
     return task
 
+def create_producer_with_retry(config, retries=5):
+    for attempt in range(1, retries + 1):
+        try:
+            producer = Producer(config)
+            # 送一個 metadata request 確認真的連得上
+            producer.list_topics(timeout=5)
+            logging.info("✅ Kafka 連線成功")
+            return producer
+        except Exception as e:
+            logging.warning(f"⚠️ Kafka 尚未就緒 (第 {attempt}/{retries} 次)，5 秒後重試...")
+            time.sleep(5)
+    raise RuntimeError("無法連線到 Kafka，請確認服務是否正常運行")
+
 def main():
     logging.info("🚀 啟動 Kafka Producer 模擬器...")
     
@@ -47,7 +60,7 @@ def main():
         'bootstrap.servers': KAFKA_BROKER,
         'client.id': 'mock-agent-producer'
     }
-    producer = Producer(producer_config)
+    producer = create_producer_with_retry(producer_config)
 
     try:
         while True:

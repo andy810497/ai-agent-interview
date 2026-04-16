@@ -76,7 +76,7 @@ services:
       - DB_NAME=insurance_db
       - DB_USER=user
       - DB_PASS=password
-      - GEMINI_API_KEY=YOUR_GEMINI_API_KEY_HERE
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
     depends_on:
       db:
         condition: service_healthy
